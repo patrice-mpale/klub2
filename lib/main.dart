@@ -298,56 +298,128 @@ class SalonData {
   // ---------------------------------------------------------------
   // JOURNAL : ajout d'opérations et calcul des bilans
   // ---------------------------------------------------------------
-  static void ajouterPrestation({
-    required int coiffeur,
-    required int montant,
-    required double note,
-  }) {
-    if (coiffeur < 0 || coiffeur >= nbCoiffeurs) return;
-    if (montant <= 0 || montant > montantMax) return;
-    journal.add(Operation(
-      id: genererId('op'),
-      type: TypeOperation.prestation,
-      date: DateTime.now(),
-      montant: montant,
-      coiffeur: coiffeur,
-      note: note.clamp(1.0, 5.0).toDouble(),
+  static Future<void> _envoyerOperation(Operation op) async {
+    final c = Compte._client;
+    if (c == null || !salonEnLigne || salonId.isEmpty || !Compte.connecte) return;
+    try {
+      await c.from('operations').insert({
+        'id': op.id,
+        'salon_id': salonId,
+        'type': op.type == TypeOperation.prestation ? 'prestation' : 'depense',
+        'date_operation': op.date.toUtc().toIso8601String(),
+        'montant': op.montant,
+        'coiffeur_numero': op.type == TypeOperation.prestation ? op.coiffeur : null,
+        'note': op.type == TypeOperation.prestation ? op.note : null,
+        'explication': op.explication,
+      });
+    } catch (e) {
+      _messengerKey.currentState?.showSnackBar(const SnackBar(
+        content: Text('Opération conservée sur le téléphone, mais envoi en ligne échoué.'),
+      ));
+    }
+  }
+
+  static Future<void> _envoyerAnnulation(Operation op) async {
+    final c = Compte._client;
+    if (c == null || !salonEnLigne || salonId.isEmpty || !Compte.connecte) return;
+    try {
+      await c.from('operations').update({
+        'annulee_le': op.annuleeLe!.toUtc().toIso8601String(),
+        'motif_annulation': op.motifAnnulation,
+      }).eq('id', op.id).eq('salon_id', salonId);
+    } catch (_) {
+      _messengerKey.currentState?.showSnackBar(const SnackBar(
+        content: Text('Annulation conservée localement, mais synchronisation échouée.'),
+      ));
+    }
+  }
+
+  static Future<void> synchroniserJournal() async {
+    final c = Compte._client;
+    if (c == null || !salonEnLigne || salonId.isEmpty || !Compte.connecte) return;
+    try {
+      final rows = await c.from('operations').select().eq('salon_id', salonId);
+      final idsServeur = rows.map((r) => r['id'] as String).toSet();
+      for (final locale in journal.where((o) => !idsServeur.contains(o.id))) {
+        try {
+          await _envoyerOperation(locale);
+          if (locale.annulee) await _envoyerAnnulation(locale);
+        } catch (_) {}
+      }
+      final ids = journal.map((o) => o.id).toSet();
+      for (final row in rows) {
+        final op = Operation.depuisJson({
+          'id': row['id'],
+          't': row['type'] == 'prestation' ? 'p' : 'd',
+          'd': DateTime.parse(row['date_operation']).toLocal().millisecondsSinceEpoch,
+          'm': row['montant'],
+          if (row['type'] == 'prestation') 'c': row['coiffeur_numero'],
+          if (row['type'] == 'prestation') 'n': (row['note'] as num).toDouble(),
+          if (row['type'] == 'depense') 'e': row['explication'],
+          if (row['annulee_le'] != null) 'a': DateTime.parse(row['annulee_le']).toLocal().millisecondsSinceEpoch,
+          if (row['motif_annulation'] != null) 'x': row['motif_annulation'],
+        });
+        if (op != null && ids.add(op.id)) journal.add(op);
+      }
+      await sauvegarder();
+    } catch (_) {}
+  }
+
+  static Future<bool> renommerCoiffeurEnLigne(int index) async {
+    if (index < 0 || index >= coiffeurs.length) return false;
+    final c = Compte._client;
+    if (c == null || !salonEnLigne || salonId.isEmpty || !Compte.connecte) return false;
+    try {
+      final rows = await c.from('coiffeurs').update({'nom': coiffeurs[index]['nom']})
+          .eq('salon_id', salonId).eq('numero', index).select();
+      return rows.isNotEmpty;
+    } catch (_) { return false; }
+  }
+
+  static Future<void> _mettreEnFile(Operation op) async {
+    await sauvegarder();
+    unawaited(_envoyerOperation(op));
+  }
+
+  static Future<void> ajouterPrestation({
+    required int coiffeur, required int montant, required double note,
+  }) async {
+    if (coiffeur < 0 || coiffeur >= nbCoiffeurs || montant <= 0 || montant > montantMax) return;
+    final op = Operation(
+      id: genererId('op'), type: TypeOperation.prestation, date: DateTime.now(),
+      montant: montant, coiffeur: coiffeur, note: note.clamp(1.0, 5.0).toDouble(),
       explication: '',
-    ));
-    unawaited(sauvegarder());
+    );
+    journal.add(op);
+    await _mettreEnFile(op);
   }
 
-  static void ajouterDepense({
-    required int montant,
-    required String explication,
-  }) {
-    if (montant <= 0 || montant > montantMax) return;
-    journal.add(Operation(
-      id: genererId('op'),
-      type: TypeOperation.depense,
-      date: DateTime.now(),
-      montant: montant,
-      coiffeur: -1,
-      note: 0,
-      explication: explication.trim(),
-    ));
-    unawaited(sauvegarder());
+  static Future<void> ajouterDepense({
+    required int montant, required String explication,
+  }) async {
+    if (montant <= 0 || montant > montantMax || explication.trim().isEmpty) return;
+    final op = Operation(
+      id: genererId('op'), type: TypeOperation.depense, date: DateTime.now(),
+      montant: montant, coiffeur: -1, note: 0, explication: explication.trim(),
+    );
+    journal.add(op);
+    await _mettreEnFile(op);
   }
 
-  // Une opération ne peut être annulée que le jour même, et une seule fois
   static bool peutEtreAnnulee(Operation op) =>
       !op.annulee && cleJour(op.date) == cleJour(DateTime.now());
 
-  // Retourne true si l'annulation a été enregistrée
-  static bool annulerOperation(String id, String motif) {
+  static Future<bool> annulerOperation(String id, String motif) async {
     final texte = motif.trim();
     if (texte.isEmpty) return false;
     final i = journal.indexWhere((o) => o.id == id);
     if (i < 0) return false;
     final op = journal[i];
     if (!peutEtreAnnulee(op)) return false;
-    journal[i] = op.avecAnnulation(DateTime.now(), texte);
-    unawaited(sauvegarder());
+    final annulee = op.avecAnnulation(DateTime.now(), texte);
+    journal[i] = annulee;
+    await sauvegarder();
+    await _envoyerAnnulation(annulee);
     return true;
   }
 
@@ -956,6 +1028,7 @@ class Compte {
       SalonData.compteId = utilisateur.id;
       unawaited(SalonData.sauvegarder());
     }
+    if (SalonData.salonEnLigne) await SalonData.synchroniserJournal();
     return null;
   }
 
@@ -1031,7 +1104,7 @@ class Compte {
         await c.from('coiffeurs').select('numero, nom').eq('salon_id', salonId);
     // Nouveau téléphone pour ce salon : on repart d'un état propre pour le code PIN
     await PinService.reinitialiser();
-    return await SalonData.adopterSalon(
+    final adopte = await SalonData.adopterSalon(
       id: salonId,
       nom: s['nom'] as String,
       commune: (s['commune'] ?? '') as String,
@@ -1041,6 +1114,8 @@ class Compte {
       compte: id,
       coiffeursEnLigne: coiffeursEnLigne,
     );
+    if (adopte) await SalonData.synchroniserJournal();
+    return adopte;
   }
 
   // Nouveau téléphone, ou création interrompue : on retrouve le salon existant
@@ -3336,12 +3411,17 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 backgroundColor: kRouge,
                 foregroundColor: Colors.white,
               ),
-              onPressed: () {
+              onPressed: () async {
                 if (controller.text.trim().isNotEmpty) {
                   setState(() {
                     SalonData.coiffeurs[index]['nom'] = controller.text.trim();
                   });
-                  unawaited(SalonData.sauvegarder());
+                  await SalonData.sauvegarder();
+                  final enLigne = await SalonData.renommerCoiffeurEnLigne(index);
+                  if (!context.mounted) return;
+                  if (SalonData.salonEnLigne && !enLigne) {
+                    ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Nom sauvegardé localement, mais en ligne non synchronisé.')));
+                  }
                   Navigator.pop(context);
                 }
               },
@@ -3474,7 +3554,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
                     backgroundColor: kRouge,
                     foregroundColor: Colors.white,
                   ),
-                  onPressed: () {
+                  onPressed: () async {
                     if (dejaValide) return;
 
                     final int? montant = SalonData.lireMontant(montantController.text);
@@ -3487,7 +3567,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
                     dejaValide = true;
                     // Une nouvelle ligne est ajoutée au journal (et enregistrée)
-                    SalonData.ajouterPrestation(
+                    await SalonData.ajouterPrestation(
                       coiffeur: coiffeurSelectionne,
                       montant: montant,
                       note: noteAttribuee,
@@ -3848,7 +3928,7 @@ class _CaisseScreenState extends State<CaisseScreen> {
                 ),
                 IconButton(
                   icon: const Icon(Icons.check_circle, color: kRouge, size: 36),
-                  onPressed: () {
+                  onPressed: () async {
                     if (dejaValide) return;
 
                     final int? montant = SalonData.lireMontant(montantController.text);
@@ -3862,9 +3942,7 @@ class _CaisseScreenState extends State<CaisseScreen> {
                     }
 
                     dejaValide = true;
-                    setState(() {
-                      SalonData.ajouterDepense(montant: montant, explication: explication);
-                    });
+                    await SalonData.ajouterDepense(montant: montant, explication: explication);
                     Navigator.pop(context);
                   },
                 ),
@@ -4199,7 +4277,7 @@ class _JourScreenState extends State<JourScreen> {
                             });
                             return;
                           }
-                          final ok = SalonData.annulerOperation(op.id, motif.text);
+                          final ok = await SalonData.annulerOperation(op.id, motif.text);
                           if (!ctx.mounted) return;
                           if (ok) {
                             Navigator.pop(ctx, true);
