@@ -244,6 +244,7 @@ class SalonData {
   static List<Operation> journal = [];
 
   // Reprise des données des anciennes versions (avant le journal)
+  static int commissionUnitaire = 0;
   static int reportEntrees = 0;
   static int reportSorties = 0;
   static List<int> reportClients = List<int>.filled(_icones.length, 0);
@@ -587,6 +588,7 @@ class SalonData {
     compteId = _texte(data['compteId']);
     role = nouveauRole;
     salonEnLigne = data['salonEnLigne'] == true;
+    commissionUnitaire = (data['commissionUnitaire'] is int && data['commissionUnitaire'] >= 0) ? data['commissionUnitaire'] as int : 0;
     coiffeurs = nouveauxCoiffeurs;
     reportEntrees = nouvelEntrees;
     reportSorties = nouvelSorties;
@@ -660,6 +662,7 @@ class SalonData {
       'compteId': compteId,
       'role': role,
       'salonEnLigne': salonEnLigne,
+      'commissionUnitaire': commissionUnitaire,
       'coiffeurs': coiffeurs.map((c) => {'nom': c['nom']}).toList(),
       'report': {
         'entrees': reportEntrees,
@@ -1414,6 +1417,7 @@ final GoRouter _router = GoRouter(
     GoRoute(path: '/dashboard', builder: (context, state) => const DashboardScreen()),
     // Historique et détail d'une journée
     GoRoute(path: '/history', builder: (context, state) => const HistoryScreen()),
+    GoRoute(path: '/commission', builder: (context, state) => const CommissionScreen()),
     GoRoute(
       path: '/history/:jour',
       builder: (context, state) => JourScreen(cle: state.pathParameters['jour'] ?? ''),
@@ -2033,7 +2037,7 @@ class _InscriptionScreenState extends State<InscriptionScreen> {
               onSubmitted: (_) => _valider(),
               validator: (v) => v != _mdp.text ? 'Les deux mots de passe sont différents' : null,
             ),
-            const SizedBox(height: 22),
+            const SizedBox(height: 14),
             ElevatedButton(
               style: styleBoutonPrincipal(),
               onPressed: _enCours ? null : _valider,
@@ -2213,6 +2217,7 @@ class _ConnexionScreenState extends State<ConnexionScreen> {
   final _formKey = GlobalKey<FormState>();
   final TextEditingController _email = TextEditingController();
   final TextEditingController _mdp = TextEditingController();
+  final TextEditingController _commission = TextEditingController(text: SalonData.commissionUnitaire.toString());
   bool _enCours = false;
   String? _erreur;
 
@@ -2222,6 +2227,13 @@ class _ConnexionScreenState extends State<ConnexionScreen> {
       _enCours = true;
       _erreur = null;
     });
+    final commission = int.tryParse(_commission.text.trim());
+    if (commission == null || commission < 0 || commission > SalonData.montantMax) {
+      setState(() { _erreur = 'Commission invalide : saisissez un entier positif ou nul.'; _enCours = false; });
+      return;
+    }
+    SalonData.commissionUnitaire = commission;
+    await SalonData.sauvegarder();
     final erreur = await Compte.connecter(_email.text, _mdp.text);
     if (!mounted) return;
     setState(() {
@@ -2249,6 +2261,7 @@ class _ConnexionScreenState extends State<ConnexionScreen> {
   void dispose() {
     _email.dispose();
     _mdp.dispose();
+    _commission.dispose();
     super.dispose();
   }
 
@@ -2279,6 +2292,13 @@ class _ConnexionScreenState extends State<ConnexionScreen> {
               action: TextInputAction.done,
               onSubmitted: (_) => _valider(),
               validator: (v) => (v ?? '').isEmpty ? 'Entrez votre mot de passe' : null,
+            ),
+            TextFormField(
+              controller: _commission,
+              keyboardType: TextInputType.number,
+              inputFormatters: [FilteringTextInputFormatter.digitsOnly, LengthLimitingTextInputFormatter(9)],
+              decoration: decorationChamp('Commission par coiffeur (CDF / prestation)', Icons.payments_outlined),
+              validator: (v) { final n = int.tryParse((v ?? '').trim()); return n == null || n < 0 ? 'Entrez un nombre entier positif ou nul' : null; },
             ),
             const SizedBox(height: 22),
             ElevatedButton(
@@ -3634,11 +3654,11 @@ class _DashboardScreenState extends State<DashboardScreen> {
                       ],
                     ),
                   ),
-                  // Verrouiller l'application tout de suite
+                  // Accès à la commission
                   IconButton(
-                    icon: const Icon(Icons.lock_outline, color: Colors.white),
-                    onPressed: () => Session.instance.verrouiller(),
-                    tooltip: 'Verrouiller',
+                    icon: const Icon(Icons.assignment_outlined, color: Colors.white),
+                    onPressed: () => context.go('/commission'),
+                    tooltip: 'Commissions',
                   ),
                   // Icône Historique
                   IconButton(
@@ -3864,6 +3884,57 @@ class _DashboardScreenState extends State<DashboardScreen> {
       ),
     );
   }
+}
+
+// =================================================================
+// COMMISSIONS : montant unitaire x prestations non encore déduites
+// =================================================================
+class CommissionScreen extends StatefulWidget {
+  const CommissionScreen({super.key});
+  @override State<CommissionScreen> createState() => _CommissionScreenState();
+}
+class _CommissionScreenState extends State<CommissionScreen> {
+  Map<int, int> _deduites = {};
+  bool _chargement = true;
+  Future<void> _charger() async {
+    try {
+      final c = Compte._client;
+      if (c != null && SalonData.salonEnLigne && SalonData.salonId.isNotEmpty) {
+        final rows = await c.from('commission_deductions').select('coiffeur_numero, prestations_deduites').eq('salon_id', SalonData.salonId);
+        final totals = <int,int>{};
+        for (final r in rows) { final k = r['coiffeur_numero'] as int; totals[k] = (totals[k] ?? 0) + (r['prestations_deduites'] as int); }
+        _deduites = totals;
+      }
+    } catch (_) {}
+    if (mounted) setState(() => _chargement = false);
+  }
+  int _prestations(int i) => SalonData.journal.where((o)=>o.type==TypeOperation.prestation && !o.annulee && o.coiffeur==i).length;
+  int _montant(int i) => (_prestations(i)-(_deduites[i]??0)).clamp(0, 1000000000).toInt() * SalonData.commissionUnitaire;
+  Future<void> _deduire(int i) async {
+    final amount = _montant(i); final count = (_prestations(i)-(_deduites[i]??0)).clamp(0, 1000000000).toInt();
+    if (amount <= 0 || count <= 0) return;
+    final confirm = await showDialog<bool>(context: context, builder: (ctx)=>AlertDialog(
+      title: const Text('Confirmer la déduction'),
+      content: Text('Déduire ${formaterMontant(amount)} CDF de commission pour ${SalonData.coiffeurs[i]['nom']} ? Cette action créera une dépense et ne pourra pas être annulée.'),
+      actions: [TextButton(onPressed:()=>Navigator.pop(ctx,false),child:const Text('Annuler')), ElevatedButton(onPressed:()=>Navigator.pop(ctx,true),child:const Text('Confirmer'))],
+    ));
+    if (confirm != true) return;
+    try {
+      final c=Compte._client;
+      if(c==null || !SalonData.salonEnLigne) throw Exception('Connexion serveur indisponible');
+      await c.rpc('deduire_commission', params: {'p_salon_id':SalonData.salonId,'p_coiffeur_numero':i,'p_montant':amount,'p_prestations':count,'p_explication':'Commission ${SalonData.coiffeurs[i]['nom']}'});
+      await SalonData.synchroniserJournal();
+      await _charger();
+      if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Commission déduite et enregistrée.')));
+    } catch(e) { if(mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content:Text('Déduction refusée : vérifiez la connexion et la migration SQL.'))); }
+  }
+  @override void initState(){super.initState();_charger();}
+  @override Widget build(BuildContext context)=>Scaffold(
+    appBar:AppBar(title:const Text('Commissions'),backgroundColor:kRouge,foregroundColor:Colors.white),
+    body:_chargement?const Center(child:CircularProgressIndicator()):ListView(padding:const EdgeInsets.all(16),children:[
+      Card(child:Padding(padding:const EdgeInsets.all(12),child:Text('Commission par prestation : ${formaterMontant(SalonData.commissionUnitaire)} CDF',style:const TextStyle(fontWeight:FontWeight.bold)))),
+      ...List.generate(SalonData.coiffeurs.length,(i){final n=(_prestations(i)-(_deduites[i]??0)).clamp(0,1000000000).toInt();final amount=_montant(i);return Card(child:ListTile(title:Text(SalonData.coiffeurs[i]['nom'],style:const TextStyle(fontWeight:FontWeight.bold)),subtitle:Text('$n prestation(s) non déduite(s)\nCommission : ${formaterMontant(amount)} CDF'),isThreeLine:true,trailing:ElevatedButton(onPressed:amount>0?()=>_deduire(i):null,style:ElevatedButton.styleFrom(backgroundColor:kOrange,foregroundColor:Colors.white),child:const Text('Déduire'))));}),
+    ]));
 }
 
 // =================================================================
